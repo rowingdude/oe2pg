@@ -25,19 +25,21 @@ import sys
 from threading import Lock, Semaphore
 from typing import List, Dict, Any, Optional, Tuple
 
+
 JAR_FILE = ""
 PROGRESS_HOST = ""
-PROGRESS_PORT = ""
+PROGRESS_PORT = ""  
 PROGRESS_DB = ""
 PROGRESS_USER = ""
-PROGRESS_SCHEMA = ""
+PROGRESS_SCHEMA= ""
 PROGRESS_PASS = ""
 PG_CONN_STRING = ""
-MAX_CURSORS = ""
-LOG_FILE = ""
-BATCH_SIZE = ""
-EXCLUDE_TABLES = ""
-IGNORE_FILE = ""
+MAX_CURSORS = 2
+LOG_FILE = "db_mirror.log"
+BATCH_SIZE = 1000
+EXCLUDE_TABLES = []  
+IGNORE_FILE = "ignored_tables.txt"
+
 
 logging.basicConfig(
     filename=LOG_FILE, 
@@ -228,9 +230,8 @@ class ProgressConnector:
                     
         return count
     
-    def fetch_and_process_data(self, schema: str, table_name: str, column_names: List[str], 
-                               pg_connector, pg_table_name: str, batch_size: int = 1000) -> int:
-        """Fetch data and process it in one go to avoid double-pulling data."""
+    def fetch_and_process_data(self, schema: str, table_name: str, column_names: List[str],
+                            pg_connector, pg_table_name: str, batch_size: int = 1000) -> int:
         if not self.connection:
             raise ConnectionError("Not connected to database")
             
@@ -265,16 +266,20 @@ class ProgressConnector:
                     row = []
                     for i in range(1, column_count + 1):
                         obj = result.getObject(i)
-                        row.append(str(obj) if obj is not None else None)
+                        # Convert Java objects to Python types
+                        if obj is not None:
+                            if hasattr(obj, 'toString'):
+                                obj = str(obj.toString())
+                            # Handle other Java types if needed (Date, Number, etc.)
+                            elif hasattr(obj, 'getTime'):  # For Date objects
+                                obj = str(obj)
+                        row.append(obj)
                     
                     current_batch.append(row)
                     if len(current_batch) >= batch_size:
                         batch_count += 1
                         total_rows += len(current_batch)
-                        rows_inserted = pg_connector.insert_data(
-                            pg_table_name, column_names, current_batch, 
-                            batch_count, estimated_batches, total_rows, total_row_count
-                        )
+                        rows_inserted = pg_connector.insert_data( pg_table_name, column_names, current_batch, batch_count, estimated_batches, total_rows, total_row_count  )
                         current_batch = []
                 if current_batch:
                     batch_count += 1
@@ -297,8 +302,7 @@ class ProgressConnector:
                     stmt.close()
                 
         return total_rows
-
-
+        
 class PostgresConnector:
     def __init__(self, conn_string: str):
         self.conn_string = conn_string
@@ -339,7 +343,9 @@ class PostgresConnector:
             
             column_defs = []
             for col in columns:
-                column_defs.append(f"\"{col['name']}\" TEXT")
+                pg_type = self.map_to_postgres_type(col["type"], col["size"])
+                nullable = "" if col["nullable"] else " NOT NULL"
+                column_defs.append(f"\"{col['name']}\" {pg_type}{nullable}")
                 
             create_query = f"CREATE TABLE IF NOT EXISTS \"{table_name}\" ({', '.join(column_defs)})"
             cursor.execute(create_query)
@@ -356,7 +362,53 @@ class PostgresConnector:
         finally:
             if cursor:
                 cursor.close()
-                
+
+    def map_to_postgres_type(self, oe_type: str, size: int) -> str:
+        # Convert Java String to Python string if needed
+        if hasattr(oe_type, 'toString'):
+            oe_type = str(oe_type.toString())
+        else:
+            oe_type = str(oe_type)
+        
+        oe_type = oe_type.upper()
+        
+        # Number types
+        if oe_type in ["INTEGER", "INT"]:
+            return "INTEGER"
+        elif oe_type == "SMALLINT":
+            return "SMALLINT"
+        elif oe_type in ["DECIMAL", "NUMERIC"]:
+            return f"NUMERIC"
+        elif oe_type == "DOUBLE PRECISION" or oe_type == "FLOAT":
+            return "DOUBLE PRECISION"
+        
+        # Date/Time types
+        elif oe_type == "DATE":
+            return "DATE"
+        elif oe_type == "DATETIME" or oe_type == "TIMESTAMP":
+            return "TIMESTAMP"
+        elif oe_type == "TIME":
+            return "TIME"
+        
+        # Text types
+        elif oe_type == "CHAR" or oe_type == "CHARACTER":
+            return f"CHAR({size})"
+        elif oe_type == "VARCHAR" or oe_type == "CHARACTER VARYING":
+            return f"VARCHAR({size})"
+        elif oe_type in ["LONG VARCHAR", "LONG VARBINARY", "CLOB"]:
+            return "TEXT"
+        elif oe_type in ["BLOB", "BINARY", "VARBINARY", "LONG VARBINARY"]:
+            return "BYTEA"
+        
+        # Boolean type
+        elif oe_type == "LOGICAL":
+            return "BOOLEAN"
+        
+        # Default to TEXT for any unrecognized types
+        else:
+            logging.info(f"Unrecognized OpenEdge type '{oe_type}' - using TEXT")
+            return "TEXT"
+                            
     def truncate_table(self, table_name: str) -> bool:
         if not self.connection:
             raise ConnectionError("Not connected to PostgreSQL database")
@@ -435,7 +487,7 @@ class PostgresConnector:
                 cursor.close()
                 
     def insert_data(self, table_name: str, column_names: List[str], batch: List[List], 
-                   batch_num: int, total_batches: int, current_rows: int, total_rows: int) -> int:
+                batch_num: int, total_batches: int, current_rows: int, total_rows: int) -> int:
         if not self.connection:
             raise ConnectionError("Not connected to PostgreSQL database")
             
@@ -470,7 +522,6 @@ class PostgresConnector:
             if cursor:
                 cursor.close()
 
-
 class DBMirror:
     def __init__(
         self, 
@@ -496,7 +547,7 @@ class DBMirror:
         
         self.postgres = PostgresConnector(postgres_conn_string)
         self.batch_size = batch_size
-        
+
     def mirror_table(self, schema: str, table_name: str, pg_table_name: str = None, truncate: bool = True) -> bool:
         if pg_table_name is None:
             pg_table_name = table_name
@@ -515,6 +566,7 @@ class DBMirror:
                 return False
                 
             column_names = [col["name"] for col in columns]
+            
             if not self.postgres.create_table(pg_table_name, columns):
                 add_to_ignore_file(f"{schema}.{table_name}")
                 return False
@@ -532,8 +584,12 @@ class DBMirror:
                 add_to_ignore_file(f"{schema}.{table_name}")
                 return False
             total_rows = self.progress.fetch_and_process_data(
-                schema, table_name, column_names, 
-                self.postgres, pg_table_name, self.batch_size
+                schema=schema, 
+                table_name=table_name, 
+                column_names=column_names, 
+                pg_connector=self.postgres, 
+                pg_table_name=pg_table_name, 
+                batch_size=self.batch_size
             )
                 
             print_status(f"Table '{schema}.{table_name}' mirroring complete - {total_rows:,} total rows transferred")
