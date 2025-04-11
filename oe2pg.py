@@ -663,6 +663,7 @@ class PostgresConnector:
             if cursor:
                 cursor.close()
 
+
 class DBMirror:
     def __init__(
         self, 
@@ -708,7 +709,66 @@ class DBMirror:
         self.results = {}
         self.results_lock = threading.Lock()
 
-    def mirror_table(self, schema: str, table_name: str, pg_table_name: str = None, truncate: bool = True) -> bool:
+    def get_primary_key(self, schema: str, table_name: str) -> Optional[str]:
+        """Retrieve the primary key column for a table, if available."""
+        def get_pk_operation(cursor):
+            metadata = self.progress.connection.jconn.getMetaData()
+            result_set = metadata.getPrimaryKeys(None, schema, table_name)
+            pk_column = None
+            while result_set.next():
+                pk_column = result_set.getString("COLUMN_NAME")
+                break  # Assume single-column PK for simplicity
+            return pk_column
+        
+        return self.progress.execute_with_cursor(get_pk_operation, f"get_pk_{schema}_{table_name}")
+
+    def get_row_hashes(self, connector, schema: str, table_name: str, column_names: List[str], 
+                      pk_column: Optional[str], limit: int = None) -> Dict[Any, str]:
+        """Compute a hash of rows for comparison, using PK if available."""
+        hashes = {}
+        is_progress = isinstance(connector, ProgressConnector)
+        description = f"hash_{schema}_{table_name}"
+
+        def hash_operation(cursor):
+            nonlocal hashes
+            columns = ", ".join([f"\"{col}\"" for col in column_names])
+            table_ref = f"\"{schema}\".\"{table_name}\"" if is_progress else f"\"{table_name}\""
+            query = f"SELECT {columns} FROM {table_ref}"
+            if limit:
+                query += f" LIMIT {limit}"
+            
+            cursor.execute(query)
+            while True:
+                row = cursor.fetchone()
+                if row is None:
+                    break
+                row_data = list(row)
+                if pk_column:
+                    pk_index = column_names.index(pk_column)
+                    pk_value = row_data[pk_index]
+                    row_hash = hash(tuple(row_data))  # Simple hash of row contents
+                    hashes[pk_value] = str(row_hash)
+                else:
+                    # Fallback: use entire row as key
+                    row_hash = hash(tuple(row_data))
+                    hashes[row_hash] = str(row_hash)
+            
+            return hashes
+        
+        if is_progress:
+            return connector.execute_with_cursor(hash_operation, description) or {}
+        else:
+            try:
+                conn = connector.get_connection()
+                cursor = conn.cursor()
+                result = hash_operation(cursor)
+                conn.commit()
+                return result
+            finally:
+                if cursor:
+                    cursor.close()
+
+    def mirror_table(self, schema: str, table_name: str, pg_table_name: str = None, truncate: bool = False) -> bool:
         if pg_table_name is None:
             pg_table_name = table_name
         
@@ -729,62 +789,227 @@ class DBMirror:
             
             column_names = [col["name"] for col in columns]
             
-            # Create table in Postgres
-            if not self.postgres.create_table(pg_table_name, columns):
-                self.ignore_manager.add(f"{schema}.{table_name}")
-                return False
+            # Create table in Postgres if it doesn't exist
+            if not self.postgres.table_exists(pg_table_name):
+                if not self.postgres.create_table(pg_table_name, columns):
+                    self.ignore_manager.add(f"{schema}.{table_name}")
+                    return False
             
-            # Get row count from source
+            # Get primary key
+            pk_column = self.get_primary_key(schema, table_name)
+            self.logger.log(f"Primary key for {schema}.{table_name}: {pk_column if pk_column else 'None'}")
+            
+            # Get row counts
             oe_row_count = self.progress.get_row_count(schema, table_name)
+            pg_row_count = self.postgres.get_row_count(pg_table_name)
+            
             if self.ignore_manager.is_ignored(f"{schema}.{table_name}"):
                 return False
             
             if oe_row_count == 0:
-                self.logger.log(f"Table {schema}.{table_name} has 0 rows. Table created in PostgreSQL but no data to transfer.")
+                self.logger.log(f"Table {schema}.{table_name} has 0 rows. No data to transfer.")
+                if pg_row_count > 0 and truncate:
+                    self.postgres.truncate_table(pg_table_name)
                 return True
             
-            # Check if data already exists in target
-            pg_row_count = self.postgres.get_row_count(pg_table_name)
-            if oe_row_count == pg_row_count and pg_row_count > 0:
-                self.logger.log(f"Table {schema}.{table_name} already has the same number of rows in PostgreSQL ({oe_row_count:,}). Skipping.")
+            # Compare data to find differences
+            if pg_row_count == oe_row_count and pg_row_count > 0:
+                self.logger.log(f"Comparing data in {schema}.{table_name}...")
+                # Sample hashes to check for differences
+                progress_hashes = self.get_row_hashes(self.progress, schema, table_name, column_names, pk_column)
+                postgres_hashes = self.get_row_hashes(self.postgres, schema, pg_table_name, column_names, pk_column)
+                
+                if pk_column:
+                    progress_keys = set(progress_hashes.keys())
+                    postgres_keys = set(postgres_hashes.keys())
+                    
+                    new_keys = progress_keys - postgres_keys
+                    common_keys = progress_keys & postgres_keys
+                    changed_keys = {k for k in common_keys if progress_hashes[k] != postgres_hashes[k]}
+                    
+                    if not new_keys and not changed_keys:
+                        self.logger.log(f"Table {schema}.{table_name} is up to date. Skipping.")
+                        return True
+                else:
+                    # Without PK, compare entire row hashes
+                    if progress_hashes == postgres_hashes:
+                        self.logger.log(f"Table {schema}.{table_name} is up to date. Skipping.")
+                        return True
+            
+            # If truncate is explicitly requested, truncate and fetch all
+            if truncate:
+                self.logger.log(f"Truncate requested for {pg_table_name}. Fetching all data.")
+                if not self.postgres.truncate_table(pg_table_name):
+                    self.ignore_manager.add(f"{schema}.{table_name}")
+                    return False
+                adjusted_batch_size = self.batch_size
+                if oe_row_count > 1000000:
+                    adjusted_batch_size = min(10000, self.batch_size * 5)
+                elif oe_row_count < 1000:
+                    adjusted_batch_size = max(100, self.batch_size // 2)
+                
+                def data_callback(batch, batch_num, total_batches, current_rows, total_rows, estimated_time):
+                    self.postgres.insert_data(
+                        pg_table_name, column_names, batch, 
+                        batch_num, total_batches, current_rows, total_rows, 
+                        estimated_time
+                    )
+                
+                total_rows = self.progress.fetch_data(
+                    schema=schema,
+                    table_name=table_name,
+                    column_names=column_names,
+                    batch_size=adjusted_batch_size,
+                    callback=data_callback
+                )
+                
+                self.logger.log(f"Table '{schema}.{table_name}' mirroring complete - {total_rows:,} total rows transferred")
                 return True
             
-            # Truncate target if needed
-            if truncate and not self.postgres.truncate_table(pg_table_name):
-                self.ignore_manager.add(f"{schema}.{table_name}")
-                return False
-            
-            # Adjust batch size based on table size for optimal performance
+            # Incremental update
+            self.logger.log(f"Performing incremental update for {schema}.{table_name}...")
             adjusted_batch_size = self.batch_size
             if oe_row_count > 1000000:
                 adjusted_batch_size = min(10000, self.batch_size * 5)
             elif oe_row_count < 1000:
                 adjusted_batch_size = max(100, self.batch_size // 2)
             
-            # Create a callback function for data processing
             def data_callback(batch, batch_num, total_batches, current_rows, total_rows, estimated_time):
-                self.postgres.insert_data(
-                    pg_table_name, column_names, batch, 
-                    batch_num, total_batches, current_rows, total_rows, 
-                    estimated_time
+                if pk_column:
+                    # Split batch into new and updated rows
+                    new_rows = []
+                    update_rows = []
+                    pk_index = column_names.index(pk_column)
+                    
+                    for row in batch:
+                        pk_value = row[pk_index]
+                        row_hash = str(hash(tuple(row)))
+                        if pk_value not in postgres_hashes:
+                            new_rows.append(row)
+                        elif postgres_hashes.get(pk_value) != row_hash:
+                            update_rows.append(row)
+                    
+                    # Insert new rows
+                    if new_rows:
+                        self.postgres.insert_data(
+                            pg_table_name, column_names, new_rows,
+                            batch_num, total_batches, current_rows, total_rows,
+                            estimated_time
+                        )
+                    
+                    # Update changed rows
+                    if update_rows:
+                        conn = self.postgres.get_connection()
+                        cursor = None
+                        try:
+                            cursor = conn.cursor()
+                            update_columns = [col for col in column_names if col != pk_column]
+                            set_clause = ", ".join([f"\"{col}\" = %s" for col in update_columns])
+                            update_query = f"UPDATE \"{pg_table_name}\" SET {set_clause} WHERE \"{pk_column}\" = %s"
+                            
+                            for row in update_rows:
+                                pk_index = column_names.index(pk_column)
+                                update_values = [row[column_names.index(col)] for col in update_columns]
+                                update_values.append(row[pk_index])
+                                cursor.execute(update_query, update_values)
+                            
+                            conn.commit()
+                        except Exception as e:
+                            self.logger.log(f"Error updating rows: {str(e)}", level=logging.ERROR)
+                            conn.rollback()
+                        finally:
+                            if cursor:
+                                cursor.close()
+                else:
+                    # Without PK, insert all rows (fallback to insert-only)
+                    self.postgres.insert_data(
+                        pg_table_name, column_names, batch,
+                        batch_num, total_batches, current_rows, total_rows,
+                        estimated_time
+                    )
+            
+            # Modify fetch_data to filter rows if PK exists
+            if pk_column:
+                def fetch_filtered_data(cursor):
+                    start_time = time.time()
+                    total_rows = 0
+                    
+                    columns_str = ", ".join([f"\"{col}\"" for col in column_names])
+                    qualified_table = f"\"{schema}\".\"{table_name}\""
+                    
+                    # Fetch only new or changed rows
+                    progress_hashes = self.get_row_hashes(self.progress, schema, table_name, column_names, pk_column)
+                    postgres_hashes = self.get_row_hashes(self.postgres, schema, pg_table_name, column_names, pk_column)
+                    
+                    new_keys = set(progress_hashes.keys()) - set(postgres_hashes.keys())
+                    changed_keys = {k for k in progress_hashes.keys() if k in postgres_hashes and progress_hashes[k] != postgres_hashes[k]}
+                    keys_to_fetch = new_keys | changed_keys
+                    
+                    if not keys_to_fetch:
+                        self.logger.log("No new or changed rows to fetch.")
+                        return 0
+                    
+                    # Fetch in batches
+                    key_list = list(keys_to_fetch)
+                    batch_size = adjusted_batch_size
+                    total_row_count = len(key_list)
+                    estimated_batches = (total_row_count + batch_size - 1) // batch_size
+                    
+                    self.logger.log(f"Fetching {total_row_count:,} new/changed rows from '{schema}.{table_name}'")
+                    
+                    current_batch = []
+                    batch_count = 0
+                    
+                    for i in range(0, len(key_list), batch_size):
+                        batch_keys = key_list[i:i + batch_size]
+                        placeholders = ", ".join(["?" for _ in batch_keys])
+                        query = f"SELECT {columns_str} FROM {qualified_table} WHERE \"{pk_column}\" IN ({placeholders})"
+                        cursor.execute(query, batch_keys)
+                        
+                        batch_rows = []
+                        while True:
+                            row = cursor.fetchone()
+                            if row is None:
+                                break
+                            batch_rows.append(row)
+                        
+                        if batch_rows:
+                            batch_count += 1
+                            total_rows += len(batch_rows)
+                            
+                            elapsed_time = time.time() - start_time
+                            rows_per_second = total_rows / max(0.1, elapsed_time)
+                            remaining_rows = total_row_count - total_rows
+                            estimated_seconds = remaining_rows / max(0.1, rows_per_second)
+                            estimated_time = self.logger.format_time(estimated_seconds)
+                            
+                            data_callback(
+                                batch_rows, batch_count, estimated_batches,
+                                total_rows, total_row_count, estimated_time
+                            )
+                    
+                    self.logger.log("")  # Newline after progress
+                    return total_rows
+                
+                total_rows = self.progress.execute_with_cursor(fetch_filtered_data, f"fetch_filtered_{schema}_{table_name}") or 0
+            else:
+                # Fallback: fetch all data
+                total_rows = self.progress.fetch_data(
+                    schema=schema,
+                    table_name=table_name,
+                    column_names=column_names,
+                    batch_size=adjusted_batch_size,
+                    callback=data_callback
                 )
             
-            # Process the data
-            total_rows = self.progress.fetch_data(
-                schema=schema,
-                table_name=table_name,
-                column_names=column_names,
-                batch_size=adjusted_batch_size,
-                callback=data_callback
-            )
-            
-            self.logger.log(f"Table '{schema}.{table_name}' mirroring complete - {total_rows:,} total rows transferred")
+            self.logger.log(f"Table '{schema}.{table_name}' mirroring complete - {total_rows:,} total rows processed")
             return True
         except Exception as e:
             self.logger.log(f"Error mirroring table {schema}.{table_name}: {str(e)}", level=logging.ERROR)
             self.ignore_manager.add(f"{schema}.{table_name}")
             return False
-    
+
+    # Rest of the DBMirror class remains unchanged
     def process_table(self, table_info, index, total):
         schema = table_info["schema"]
         table_name = table_info["name"]
@@ -802,77 +1027,77 @@ class DBMirror:
             self.logger.log(f"  ✗ Failed to mirror table '{schema}.{table_name}'")
     
     def mirror_all_tables(self, exclude_tables: List[str] = None) -> Dict[str, bool]:
-            if exclude_tables is None:
-                exclude_tables = []
+        if exclude_tables is None:
+            exclude_tables = []
+        
+        # Combine exclude tables with ignored tables
+        ignored_tables = self.ignore_manager.get_all()
+        exclude_set = set(exclude_tables).union(ignored_tables)
+        
+        self.logger.log(f"Tables in ignore file: {len(ignored_tables)}")
+        self.logger.log("\n=== Starting database mirroring process ===\n")
+        
+        # Establish connections
+        if not self.progress.connect():
+            self.logger.log("Failed to connect to Progress database")
+            return {}
+        
+        if not self.postgres.connect():
+            self.logger.log("Failed to connect to PostgreSQL database")
+            self.progress.disconnect()
+            return {}
+        
+        try:
+            # Get table list
+            tables = self.progress.get_tables()
+            self.results = {}
             
-            # Combine exclude tables with ignored tables
-            ignored_tables = self.ignore_manager.get_all()
-            exclude_set = set(exclude_tables).union(ignored_tables)
+            self.logger.log(f"\nTotal tables to process: {len(tables)}")
             
-            self.logger.log(f"Tables in ignore file: {len(ignored_tables)}")
-            self.logger.log("\n=== Starting database mirroring process ===\n")
+            if exclude_set:
+                self.logger.log(f"Tables to exclude: {len(exclude_set)}")
+                
+            # Filter tables
+            included_tables = []
+            for t in tables:
+                full_name = f"{t['schema']}.{t['name']}"
+                if full_name not in exclude_set and t["name"] not in exclude_set:
+                    included_tables.append(t)
+                
+            self.logger.log(f"Tables to mirror: {len(included_tables)}")
             
-            # Establish connections
-            if not self.progress.connect():
-                self.logger.log("Failed to connect to Progress database")
-                return {}
+            # Get table sizes for sorting
+            table_sizes = {}
+            for t in included_tables:
+                schema = t["schema"]
+                table_name = t["name"]
+                size = self.progress.get_row_count(schema, table_name)
+                table_sizes[f"{schema}.{table_name}"] = size
             
-            if not self.postgres.connect():
-                self.logger.log("Failed to connect to PostgreSQL database")
-                self.progress.disconnect()
-                return {}
+            # Sort tables by size (smallest first for quick wins)
+            sorted_tables = sorted(included_tables, 
+                                key=lambda t: table_sizes.get(f"{t['schema']}.{t['name']}", 0))
             
-            try:
-                # Get table list
-                tables = self.progress.get_tables()
-                self.results = {}
+            # Calculate total estimated time
+            total_rows = sum(table_sizes.values())
+            estimated_rows_per_sec = 500  # Conservative estimate
+            total_estimated_seconds = total_rows / estimated_rows_per_sec
+            self.logger.log(f"Estimated total time: {self.logger.format_time(total_estimated_seconds)}")
+            
+            # Process tables
+            if self.max_workers > 1:
+                self._parallel_process_tables(sorted_tables)
+            else:
+                self._sequential_process_tables(sorted_tables)
                 
-                self.logger.log(f"\nTotal tables to process: {len(tables)}")
-                
-                if exclude_set:
-                    self.logger.log(f"Tables to exclude: {len(exclude_set)}")
-                    
-                # Filter tables
-                included_tables = []
-                for t in tables:
-                    full_name = f"{t['schema']}.{t['name']}"
-                    if full_name not in exclude_set and t["name"] not in exclude_set:
-                        included_tables.append(t)
-                    
-                self.logger.log(f"Tables to mirror: {len(included_tables)}")
-                
-                # Get table sizes for sorting
-                table_sizes = {}
-                for t in included_tables:
-                    schema = t["schema"]
-                    table_name = t["name"]
-                    size = self.progress.get_row_count(schema, table_name)
-                    table_sizes[f"{schema}.{table_name}"] = size
-                
-                # Sort tables by size (smallest first for quick wins)
-                sorted_tables = sorted(included_tables, 
-                                    key=lambda t: table_sizes.get(f"{t['schema']}.{t['name']}", 0))
-                
-                # Calculate total estimated time
-                total_rows = sum(table_sizes.values())
-                estimated_rows_per_sec = 500  # Conservative estimate
-                total_estimated_seconds = total_rows / estimated_rows_per_sec
-                self.logger.log(f"Estimated total time: {self.logger.format_time(total_estimated_seconds)}")
-                
-                # Process tables
-                if self.max_workers > 1:
-                    self._parallel_process_tables(sorted_tables)
-                else:
-                    self._sequential_process_tables(sorted_tables)
-                    
-                return self.results
-                
-            except Exception as e:
-                self.logger.log(f"Error during mirroring: {str(e)}", level=logging.ERROR)
-                return {}
-                
-            finally:
-                self.progress.disconnect()
+            return self.results
+            
+        except Exception as e:
+            self.logger.log(f"Error during mirroring: {str(e)}", level=logging.ERROR)
+            return {}
+            
+        finally:
+            self.progress.disconnect()
     
     def _parallel_process_tables(self, tables):
         """Process tables in parallel using a thread pool"""
@@ -918,7 +1143,6 @@ class DBMirror:
             report.append(f"Failed tables: {', '.join(failed_tables)}")
         
         return "\n".join(report)
-
 
 def main():
 
