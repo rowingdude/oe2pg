@@ -1,24 +1,37 @@
-After tinkering with this a bit more, I'm going to release it as a mostly finished product stamped pre-release v0.90.
+# Openedge to PostgreSQL Mirroring Tool
 
-It works as expected, via JVM, it connects to the OE database and queries the stipulated schema's metadata.
+## Summary
 
-While running, it looks like this:
+This script performs table mirroring with incremental update reconciliation. THe goal was to mirror a database and then track changes to it. 
+Because our old database does not have the best indexing or keys set up, this script attempts three modes to reconcile its progress, in the
+first round, it looks for a primary key it can reference, in the second round, it looks for time (timedate) stamps, if neither are found, it 
+does a hash of the data and compares rows via hash (THIS IS VERY SLOW). The program informs the user of which mode it's taken.
 
-    Processing table 44/999: SCHEMA.table_name
-    
-		=== Mirroring table: SCHEMA.table_name to table_name ===
-		Fetching columns for table 'SCHEMA.table_name'... Found 13 columns
-		Creating table 'table_name' in PostgreSQL... Done
-		Counting rows in 'SCHEMA.table_name'... Found 132,111 rows
-		Truncating table 'table_name' in PostgreSQL... Done
-		Counting rows in 'SCHEMA.table_name'... Found 132,111 rows
-		Mirroring 'SCHEMA.table_name' (132,111 rows, ~133 batches)
-		Processing table_name: Batch 114/133 (86.3%, 114,000/132,111 rows)
-		^C
-		Error during mirroring: Java Virtual Machine is not running
-		Disconnecting from Progress DB... Failed!
-		Disconnect error: Java Virtual Machine is not running
-		Disconnecting from PostgreSQL... Done
+Once running, users will notice two ouputs, if the data is up to date, the output will be as in #1, whereas if there are updates, #2 is shown.
+
+###  1: No Updates (All data synced)
+
+        === Mirroring table: SCHEMA.original_table to original_table ===
+        Fetching columns for table 'SCHEMA.original_table0'... Found 1 columns
+        Fetching 235 new/changed rows from 'SCHEMA.original_table1'
+        Primary key for SCHEMA.original_table0: orig_pk
+        Counting rows in 'SCHEMA.original_table'... Found 7,093 rows
+        Counting rows in PostgreSQL table 'original_table0'... Found 7,093 rows
+        Comparing data in SCHEMA.original_table0...
+        Table SCHEMA.original_table is up to date. Skipping.
+        ✓ Table 'SCHEMA.original_table0' mirrored successfully
+
+###  2: New data (incremental update)
+
+        === Mirroring table: SCHEMA.table_a to table_a ===
+        Fetching columns for table 'SCHEMA.table_a'... Found 5 columns
+        Primary key for SCHEMA.table_a: table_a_pk
+        Counting rows in 'SCHEMA.table_a'... Found 8,586 rows
+        Counting rows in PostgreSQL table 'table_a'... Found 8,586 rows
+        Comparing data in SCHEMA.table_a...
+        Performing incremental update for SCHEMA.table_b...
+        Table SCHEMA.table_a is up to date. Skipping.
+        ✓ Table 'SCHEMA.table_a' mirrored successfully
 
 
-Hopefully someone else is actively working to escape OE hell and come to the land of promise!
+If you have any questions, comments, or critiques, please reach out! Cheers
