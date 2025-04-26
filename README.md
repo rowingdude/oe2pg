@@ -5,14 +5,14 @@ This utility provides a robust, configurable mechanism for mirroring data from P
 
 I've focused on a few features for the initial release, just to get it working:
 
-* Automatically selects the most efficient synchronization approach (full, key-based, or timestamp-based) for each table based on sizing and columns present
+* Automatically selects the most efficient synchronization approach (full, pk, or timestamp) for each table based on sizing and columns present
 * Attempts to resolve  changes in source database structure to the target database
 * Batched processing to optimize memory usage and network traffic
 * User settings for batch sizes (see `settings.json`) and table exclusions (via a plain text file called `ignored_tables.txt`)
 
-WORK IN PROGRESS: Incremental Updates
-WORK IN PROGRESS: Complete Progress Tracking - Goal is to give the user detailed metrics on synchronization progress and completion percentages
-WORK IN PROGRESS: Failure Recovery - this runs along with "Incremental Updates", but we populate a `tracking` table with the goal of resuming on failure
+- WORK IN PROGRESS: Incremental Updates
+- WORK IN PROGRESS: Complete Progress Tracking - Goal is to give the user detailed metrics on synchronization progress and completion percentages
+- WORK IN PROGRESS: Failure Recovery - this runs along with "Incremental Updates", but we populate a `tracking` table with the goal of resuming on failure
 
 ### System Requirements
 
