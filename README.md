@@ -1,28 +1,43 @@
 ## OpenEdge to PostgreSQL Data Synchronization Tool
 
 ### Overview
-This utility provides a robust, configurable mechanism for mirroring data from Progress OpenEdge databases to PostgreSQL. It supports both full table synchronization and incremental updates, minimizing resource usage while maintaining data consistency between systems.
+This is a mechanism for mirroring data from Progress OpenEdge databases to PostgreSQL. I aim to supports both full table synchronization and incremental updates.
 
 I've focused on a few features for the initial release, just to get it working:
 
 * Automatically selects the most efficient synchronization approach (full, pk, or timestamp) for each table based on sizing and columns present
 * Attempts to resolve  changes in source database structure to the target database
 * Batched processing to optimize memory usage and network traffic
-* User settings for batch sizes (see `settings.json`) and table exclusions (via a plain text file called `ignored_tables.txt`)
+* User settings for batch sizes (see `authentication.py`) and table exclusions (via a plain text file called `ignored_tables.txt`)
 
-- WORK IN PROGRESS: Incremental Updates
-- WORK IN PROGRESS: Complete Progress Tracking - Goal is to give the user detailed metrics on synchronization progress and completion percentages
-- WORK IN PROGRESS: Failure Recovery - this runs along with "Incremental Updates", but we populate a `tracking` table with the goal of resuming on failure
+These are the most pressing features I need to work on:
+
+-  Incremental Updates
+-  Whole job progress tracking 
+-  Failure recovery - this runs along with "Incremental Updates", but we populate a `tracking` table with the goal of resuming on failure
 
 ### System Requirements
 
-* Python 3.8 or higher
+* Python 3.8 or higher (with `jaydeebeeapi` and  `psycopg2`)
 * Access to OpenEdge database with JDBC connectivity
 * PostgreSQL database with write permissions
 * Sufficient network bandwidth between systems
 
+#### Python Package Installations:
+
+Most major distributions maintain released versions of these packages. As such, we can install them directly without `pip`:
+
+* Ubuntu: `sudo apt update; sudo apt install -y python3-psycopg2 python3-jaydebeeapi`
+* Fedora: `sudo dnf update; sudo dnf install -y python3-psycopg2 python3-jaydebeeapi`
+* Arch:   `sudo pacman -Syu; sudo pacman -Sy python3-psycopg2 python3-jaydebeeapi`
+* Gentoo: `emerge --sync --quiet; sudo emerge python3-psycopg2 python3-jaydebeeapi`
+
+#### Note about PostgreSQL Installation
+
+I do recommend users on major distributions (Ubuntu, Fedora) add the PostgreSQL repo to their package manager source list, you can find the directions here [PostgreSQL Downloads](https://www.postgresql.org/download/).
+
 ### Configuration
-The tool expects a configuration file with the following sections:
+The tool expects the authentication configuration file with to contain these following sections:
 
 ``` json
   {
@@ -99,8 +114,8 @@ The tool logs detailed progress information to both console and the configured l
 # Security Considerations
 
 * _Database credentials are stored in plaintext in the configuration file_
-* Ensure the configuration file has appropriate permissions, on *Nix operating systems, I recommend `chmod 500 config.json` and `chown <db_etl_user>:<db_etl_group> config.json`
-* Environment variables should be used over `config.json` in production
+* Ensure the configuration file has appropriate permissions, on *Nix operating systems, I recommend `chmod 500 authentication.py` and `chown <db_etl_user>:<db_etl_group> config.json`
+* Environment variables should be used over `authentication.py` in production
 
 
 Thank you for checking out my project, if you have any ideas to improve it, I'm all ears!
