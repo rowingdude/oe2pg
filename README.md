@@ -50,15 +50,15 @@ The tool expects a configuration file with the following sections:
 ### Usage
 
 * First-time Synchronization
-  - For initial data load, use the --full-sync flag: `python data_sync.py --full-sync`
+  - For initial data load, use the --full-sync flag: `python oe2pg.py --full-sync`
   - This creates all necessary tables and performs a complete mirror of all accessible tables.
     
 * Incremental Updates
-  - For routine updates after initial sync: `python data_sync.py`
+  - For routine updates after initial sync: `python oe2pg.py`
   - This (eventually) detects and transfers only new or modified records since the last synchronization.
     
 * Selective Synchronization
-  - To exclude specific tables: `python data_sync.py --ignore-table TABLE1 --ignore-table TABLE2`
+  - To exclude specific tables: `python oe2pg.py --ignore-table TABLE1 --ignore-table TABLE2`
 
 #### Operation Modes
 The tool supports three synchronization methods:
