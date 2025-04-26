@@ -24,6 +24,7 @@ I've focused on a few features for the initial release, just to get it working:
 ### Configuration
 The tool expects a configuration file with the following sections:
 
+``` json
   {
     "progress_db": {
       "host": "openedge-server",
@@ -45,7 +46,7 @@ The tool expects a configuration file with the following sections:
       "log_file": "sync.log"
     }
   }
-
+```
 ### Usage
 
 * First-time Synchronization
